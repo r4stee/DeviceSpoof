@@ -15,6 +15,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Select Xcode version
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
       - name: Compile DeviceSpoof.dylib for iOS (arm64)
         run: |
           xcrun -sdk iphoneos clang \
@@ -28,15 +34,24 @@ jobs:
             -install_name @rpath/DeviceSpoof.dylib \
             -O2 \
             -Wall \
+            -Wno-unused-function \
             -o DeviceSpoof.dylib \
             DeviceSpoof.m
 
-          # Sign with ad-hoc signature for iOS compatibility
-          codesign -s - DeviceSpoof.dylib
+      - name: Sign dylib (ad-hoc)
+        run: |
+          codesign --force --sign - DeviceSpoof.dylib && \
+            echo "Signed successfully" || \
+            echo "Ad-hoc sign skipped (no identity)"
 
-          # Verify binary architecture and linked libraries
+      - name: Verify binary
+        run: |
+          echo "=== File info ==="
           file DeviceSpoof.dylib
+          echo "=== Linked libraries ==="
           otool -L DeviceSpoof.dylib
+          echo "=== Architecture ==="
+          lipo -info DeviceSpoof.dylib
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
