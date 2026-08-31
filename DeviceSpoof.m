@@ -1,31 +1,35 @@
-
-// =============================================================================
+﻿// =============================================================================
 //  DeviceSpoof.m
-//  Multi-Layer / Low-Level Device Spoofing — iOS arm64 (No Jailbreak)
+//  Multi-Layer Device Spoofing — iOS arm64 (No Jailbreak)
 //
-//  Layer 1 : Objective-C Runtime Swizzling (UIDevice, ASIdentifierManager)
-//  Layer 2 : Keychain Reset & Security Layer (SecItemCopyMatching block)
-//  Layer 3 : C-Level Low-Level Filters (stat() interpose for jailbreak paths)
+//  FIX v2:
+//   - Static UUID: generated ONCE at startup, same value returned every call
+//     (prevents app internal data mismatch / freeze when called repeatedly)
+//   - Keychain hook REMOVED: apps can read their own internal keys normally
+//     (prevents black screen / freeze caused by missing renderer keys)
 //
-//  Frameworks : Foundation, UIKit, Security, AdSupport
+//  Frameworks : Foundation, UIKit, AdSupport
 //  Compiled with: ARC enabled, no warnings
 // =============================================================================
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <Security/Security.h>
 #import <AdSupport/AdSupport.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <errno.h>
 
-#pragma mark - ═══════════════════════════════════════════════════════════════
-#pragma mark   LAYER 3 — C-Level stat() Interpose (Early Definition)
-#pragma mark - ═══════════════════════════════════════════════════════════════
+#pragma mark - Static UUID Storage (generated once, reused every call)
 
-/// Paths that betray sideload / debug / jailbreak presence.
-/// Returning ENOENT for these makes the host app believe they don't exist.
+/// One IDFV per session — set at constructor time, never changes.
+static NSUUID *ds_static_idfv = nil;
+/// One IDFA per session — set at constructor time, never changes.
+static NSUUID *ds_static_idfa = nil;
+
+#pragma mark - C-Level stat() Filter (hides jailbreak / frida paths)
+
 static const char * const kSuspiciousPaths[] = {
     "/Library/MobileSubstrate",
     "/Library/MobileSubstrate/MobileSubstrate.dylib",
@@ -44,7 +48,6 @@ static const char * const kSuspiciousPaths[] = {
     "/private/var/lib/apt",
     "/private/var/lib/cydia",
     "/private/var/stash",
-    "/private/var/mobile/Library/SBSettings",
     "/usr/lib/libcycript.dylib",
     "/usr/lib/frida",
     "/usr/local/lib/frida",
@@ -53,66 +56,48 @@ static const char * const kSuspiciousPaths[] = {
     "/usr/bin/frida",
     "/usr/sbin/frida",
     "/usr/local/bin/frida",
-    "/usr/share/frida",
     "FridaGadget",
     "frida-agent",
     "Substrate",
     NULL
 };
 
-/// Checks whether the given path matches any suspicious pattern.
 static BOOL ds_path_is_suspicious(const char *path) {
     if (!path) return NO;
-    for (NSInteger i = 0; kSuspiciousPaths[i] != NULL; i++) {
-        if (strstr(path, kSuspiciousPaths[i]) != NULL) {
-            return YES;
-        }
+    for (int i = 0; kSuspiciousPaths[i] != NULL; i++) {
+        if (strstr(path, kSuspiciousPaths[i]) != NULL) return YES;
     }
     return NO;
 }
 
-// Pointer to the real stat() resolved once at constructor time.
-static int (*real_stat)(const char * __restrict, struct stat * __restrict) = NULL;
-// Pointer to the real lstat() resolved once at constructor time.
+static int (*real_stat)(const char * __restrict, struct stat * __restrict)  = NULL;
 static int (*real_lstat)(const char * __restrict, struct stat * __restrict) = NULL;
 
-/// Our replacement for stat(): intercepts suspicious paths and returns ENOENT.
 static int ds_stat(const char * __restrict path, struct stat * __restrict buf) {
-    if (ds_path_is_suspicious(path)) {
-        errno = ENOENT;
-        return -1;
-    }
+    if (ds_path_is_suspicious(path)) { errno = ENOENT; return -1; }
     return real_stat ? real_stat(path, buf) : -1;
 }
 
-/// Our replacement for lstat(): same logic.
 static int ds_lstat(const char * __restrict path, struct stat * __restrict buf) {
-    if (ds_path_is_suspicious(path)) {
-        errno = ENOENT;
-        return -1;
-    }
+    if (ds_path_is_suspicious(path)) { errno = ENOENT; return -1; }
     return real_lstat ? real_lstat(path, buf) : -1;
 }
 
-#pragma mark - ═══════════════════════════════════════════════════════════════
-#pragma mark   LAYER 2 — Keychain Reset & Security Layer
-#pragma mark - ═══════════════════════════════════════════════════════════════
+#pragma mark - DYLD_INTERPOSE
 
-/// Original function pointer for SecItemCopyMatching.
-static OSStatus (*real_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result) = NULL;
+#define DYLD_INTERPOSE(_repl, _orig) \
+    __attribute__((used)) static struct { \
+        const void *replacement; const void *original; \
+    } _interpose_##_orig \
+    __attribute__((section("__DATA,__interpose"))) = { \
+        (const void *)(unsigned long)&(_repl), \
+        (const void *)(unsigned long)&(_orig) \
+    };
 
-/// Our shim: always reports "not found", wiping any fingerprint stored by a
-/// previous app installation (previous-band residue).
-static OSStatus ds_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    // Block any query that tries to read from the Keychain so that persistent
-    // identifiers (e.g. "vendor ID stored across reinstalls") are invisible.
-    if (result) { *result = NULL; }
-    return errSecItemNotFound;
-}
+DYLD_INTERPOSE(ds_stat,  stat)
+DYLD_INTERPOSE(ds_lstat, lstat)
 
-#pragma mark - ═══════════════════════════════════════════════════════════════
-#pragma mark   LAYER 1A — UIDevice Swizzle (IDFV + name + model)
-#pragma mark - ═══════════════════════════════════════════════════════════════
+#pragma mark - UIDevice Swizzle (IDFV + name + model)
 
 @interface UIDevice (DSSwizzle)
 - (NSUUID *)ds_identifierForVendor;
@@ -122,26 +107,13 @@ static OSStatus ds_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 
 @implementation UIDevice (DSSwizzle)
 
-/// Returns a freshly generated random UUID every time — nothing is cached.
-- (NSUUID *)ds_identifierForVendor {
-    return [[NSUUID UUID] init];
-}
-
-/// Returns a generic, non-identifying device name.
-- (NSString *)ds_name {
-    return @"iPhone";
-}
-
-/// Return a generic model identifier.
-- (NSString *)ds_model {
-    return @"iPhone";
-}
+- (NSUUID *)ds_identifierForVendor { return ds_static_idfv; }
+- (NSString *)ds_name              { return @"iPhone"; }
+- (NSString *)ds_model             { return @"iPhone"; }
 
 @end
 
-#pragma mark - ═══════════════════════════════════════════════════════════════
-#pragma mark   LAYER 1B — ASIdentifierManager Swizzle (IDFA)
-#pragma mark - ═══════════════════════════════════════════════════════════════
+#pragma mark - ASIdentifierManager Swizzle (IDFA)
 
 @interface ASIdentifierManager (DSSwizzle)
 - (NSUUID *)ds_advertisingIdentifier;
@@ -150,148 +122,62 @@ static OSStatus ds_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
 
 @implementation ASIdentifierManager (DSSwizzle)
 
-/// Returns a freshly generated random UUID every time.
-- (NSUUID *)ds_advertisingIdentifier {
-    return [[NSUUID UUID] init];
-}
-
-/// Reports tracking as disabled so callers cannot use the IDFA for attribution.
-- (BOOL)ds_isAdvertisingTrackingEnabled {
-    return NO;
-}
+- (NSUUID *)ds_advertisingIdentifier    { return ds_static_idfa; }
+- (BOOL)ds_isAdvertisingTrackingEnabled { return NO; }
 
 @end
 
-#pragma mark - ═══════════════════════════════════════════════════════════════
-#pragma mark   Swizzle Utility
-#pragma mark - ═══════════════════════════════════════════════════════════════
+#pragma mark - Swizzle Utility
 
-/// Thread-safe, add-or-exchange method swizzle.
-static void ds_swizzle(Class cls, SEL original, SEL replacement) {
-    if (!cls || !original || !replacement) return;
-
-    Method origMethod = class_getInstanceMethod(cls, original);
-    Method replMethod = class_getInstanceMethod(cls, replacement);
-
-    if (!origMethod || !replMethod) {
-        NSLog(@"[DeviceSpoof] swizzle skipped — method not found "
-              "in %@ (orig=%s, repl=%s)",
-              NSStringFromClass(cls),
-              sel_getName(original),
-              sel_getName(replacement));
-        return;
-    }
-
-    // Try to add the original selector backed by the replacement IMP first.
-    BOOL added = class_addMethod(cls,
-                                 original,
-                                 method_getImplementation(replMethod),
-                                 method_getTypeEncoding(replMethod));
+static void ds_swizzle(Class cls, SEL orig, SEL repl) {
+    if (!cls || !orig || !repl) return;
+    Method origM = class_getInstanceMethod(cls, orig);
+    Method replM = class_getInstanceMethod(cls, repl);
+    if (!origM || !replM) return;
+    BOOL added = class_addMethod(cls, orig,
+                                 method_getImplementation(replM),
+                                 method_getTypeEncoding(replM));
     if (added) {
-        // The class didn't have its own implementation; point replacement IMP.
-        class_replaceMethod(cls,
-                            replacement,
-                            method_getImplementation(origMethod),
-                            method_getTypeEncoding(origMethod));
+        class_replaceMethod(cls, repl,
+                            method_getImplementation(origM),
+                            method_getTypeEncoding(origM));
     } else {
-        // The class already has the method — swap IMPs atomically.
-        method_exchangeImplementations(origMethod, replMethod);
+        method_exchangeImplementations(origM, replM);
     }
-
-    NSLog(@"[DeviceSpoof] Swizzled %@ — %s <-> %s",
-          NSStringFromClass(cls),
-          sel_getName(original),
-          sel_getName(replacement));
+    NSLog(@"[DeviceSpoof] swizzled %@ %s <-> %s",
+          NSStringFromClass(cls), sel_getName(orig), sel_getName(repl));
 }
 
-#pragma mark - ═══════════════════════════════════════════════════════════════
-#pragma mark   C-Symbol Resolution (dlsym RTLD_NEXT)
-#pragma mark - ═══════════════════════════════════════════════════════════════
-
-static void ds_install_c_level_filters(void) {
-    // Resolve originals via dlsym so we can forward non-suspicious calls.
-    real_stat  = (int (*)(const char * __restrict, struct stat * __restrict))
-                  dlsym(RTLD_NEXT, "stat");
-    real_lstat = (int (*)(const char * __restrict, struct stat * __restrict))
-                  dlsym(RTLD_NEXT, "lstat");
-
-    // Resolve SecItemCopyMatching original.
-    real_SecItemCopyMatching = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))
-                                dlsym(RTLD_NEXT, "SecItemCopyMatching");
-
-    if (real_stat && real_lstat) {
-        NSLog(@"[DeviceSpoof] C-level stat symbols resolved — shims active.");
-    } else {
-        NSLog(@"[DeviceSpoof] One or more stat symbols not resolved via dlsym.");
-    }
-}
-
-#pragma mark - ═══════════════════════════════════════════════════════════════
-#pragma mark   DYLD_INTERPOSE Macros
-#pragma mark - ═══════════════════════════════════════════════════════════════
-
-// These macros tell dyld to transparently replace the named C functions with
-// our shims across all images loaded in the process — no fishhook needed.
-#define DYLD_INTERPOSE(_replacement, _original) \
-    __attribute__((used)) static struct { \
-        const void *replacement; \
-        const void *original; \
-    } _interpose_##_original \
-    __attribute__((section("__DATA,__interpose"))) = { \
-        (const void *)(unsigned long)&(_replacement), \
-        (const void *)(unsigned long)&(_original)  \
-    };
-
-DYLD_INTERPOSE(ds_stat,   stat)
-DYLD_INTERPOSE(ds_lstat,  lstat)
-DYLD_INTERPOSE(ds_SecItemCopyMatching, SecItemCopyMatching)
-
-#pragma mark - ═══════════════════════════════════════════════════════════════
-#pragma mark   CONSTRUCTOR — Early Runtime Load (priority 101)
-#pragma mark - ═══════════════════════════════════════════════════════════════
+#pragma mark - Constructor (priority 101 — earliest load)
 
 __attribute__((constructor(101)))
 static void DeviceSpoof_Initialize(void) {
     @autoreleasepool {
+        // 1. Generate static UUIDs ONCE for this session
+        ds_static_idfv = [NSUUID UUID];
+        ds_static_idfa = [NSUUID UUID];
+        NSLog(@"[DeviceSpoof] IDFV=%@  IDFA=%@",
+              ds_static_idfv.UUIDString, ds_static_idfa.UUIDString);
 
-        NSLog(@"[DeviceSpoof] Multi-Layer Device Spoof — Initializing...");
+        // 2. Resolve real stat/lstat for passthrough
+        real_stat  = (int (*)(const char * __restrict, struct stat * __restrict))
+                      dlsym(RTLD_NEXT, "stat");
+        real_lstat = (int (*)(const char * __restrict, struct stat * __restrict))
+                      dlsym(RTLD_NEXT, "lstat");
 
-        // Layer 3: C-level symbol resolution
-        ds_install_c_level_filters();
+        // 3. UIDevice swizzles
+        Class dev = [UIDevice class];
+        ds_swizzle(dev, @selector(identifierForVendor), @selector(ds_identifierForVendor));
+        ds_swizzle(dev, @selector(name),                @selector(ds_name));
+        ds_swizzle(dev, @selector(model),               @selector(ds_model));
 
-        // Layer 1A: UIDevice swizzles
-        Class uiDeviceClass = [UIDevice class];
-
-        ds_swizzle(uiDeviceClass,
-                   @selector(identifierForVendor),
-                   @selector(ds_identifierForVendor));
-
-        ds_swizzle(uiDeviceClass,
-                   @selector(name),
-                   @selector(ds_name));
-
-        ds_swizzle(uiDeviceClass,
-                   @selector(model),
-                   @selector(ds_model));
-
-        // Layer 1B: ASIdentifierManager swizzles
-        Class asmClass = objc_getClass("ASIdentifierManager");
-        if (asmClass) {
-            ds_swizzle(asmClass,
-                       @selector(advertisingIdentifier),
-                       @selector(ds_advertisingIdentifier));
-
-            ds_swizzle(asmClass,
-                       @selector(isAdvertisingTrackingEnabled),
-                       @selector(ds_isAdvertisingTrackingEnabled));
-        } else {
-            NSLog(@"[DeviceSpoof] ASIdentifierManager not found — "
-                  "AdSupport framework may not be linked.");
+        // 4. ASIdentifierManager swizzles
+        Class asm_ = objc_getClass("ASIdentifierManager");
+        if (asm_) {
+            ds_swizzle(asm_, @selector(advertisingIdentifier),       @selector(ds_advertisingIdentifier));
+            ds_swizzle(asm_, @selector(isAdvertisingTrackingEnabled), @selector(ds_isAdvertisingTrackingEnabled));
         }
 
-        // Layer 2: Keychain blocking is handled by DYLD_INTERPOSE above.
-        NSLog(@"[DeviceSpoof] Keychain shim (SecItemCopyMatching) active via DYLD_INTERPOSE.");
-        NSLog(@"[DeviceSpoof] All layers loaded successfully.");
+        NSLog(@"[DeviceSpoof] v2 ready — static UUID, keychain passthrough.");
     }
 }
-
