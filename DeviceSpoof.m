@@ -73,8 +73,6 @@ static BOOL ds_path_is_suspicious(const char *path) {
 
 // Pointer to the real stat() resolved once at constructor time.
 static int (*real_stat)(const char * __restrict, struct stat * __restrict) = NULL;
-// Pointer to the real stat64() resolved once at constructor time.
-static int (*real_stat64)(const char * __restrict, struct stat64 * __restrict) = NULL;
 // Pointer to the real lstat() resolved once at constructor time.
 static int (*real_lstat)(const char * __restrict, struct stat * __restrict) = NULL;
 
@@ -85,15 +83,6 @@ static int ds_stat(const char * __restrict path, struct stat * __restrict buf) {
         return -1;
     }
     return real_stat ? real_stat(path, buf) : -1;
-}
-
-/// Our replacement for stat64(): same logic.
-static int ds_stat64(const char * __restrict path, struct stat64 * __restrict buf) {
-    if (ds_path_is_suspicious(path)) {
-        errno = ENOENT;
-        return -1;
-    }
-    return real_stat64 ? real_stat64(path, buf) : -1;
 }
 
 /// Our replacement for lstat(): same logic.
@@ -221,18 +210,16 @@ static void ds_swizzle(Class cls, SEL original, SEL replacement) {
 
 static void ds_install_c_level_filters(void) {
     // Resolve originals via dlsym so we can forward non-suspicious calls.
-    real_stat   = (int (*)(const char * __restrict, struct stat * __restrict))
-                   dlsym(RTLD_NEXT, "stat");
-    real_stat64 = (int (*)(const char * __restrict, struct stat64 * __restrict))
-                   dlsym(RTLD_NEXT, "stat64");
-    real_lstat  = (int (*)(const char * __restrict, struct stat * __restrict))
-                   dlsym(RTLD_NEXT, "lstat");
+    real_stat  = (int (*)(const char * __restrict, struct stat * __restrict))
+                  dlsym(RTLD_NEXT, "stat");
+    real_lstat = (int (*)(const char * __restrict, struct stat * __restrict))
+                  dlsym(RTLD_NEXT, "lstat");
 
     // Resolve SecItemCopyMatching original.
     real_SecItemCopyMatching = (OSStatus (*)(CFDictionaryRef, CFTypeRef *))
                                 dlsym(RTLD_NEXT, "SecItemCopyMatching");
 
-    if (real_stat && real_stat64 && real_lstat) {
+    if (real_stat && real_lstat) {
         NSLog(@"[DeviceSpoof] C-level stat symbols resolved — shims active.");
     } else {
         NSLog(@"[DeviceSpoof] One or more stat symbols not resolved via dlsym.");
@@ -256,7 +243,6 @@ static void ds_install_c_level_filters(void) {
     };
 
 DYLD_INTERPOSE(ds_stat,   stat)
-DYLD_INTERPOSE(ds_stat64, stat64)
 DYLD_INTERPOSE(ds_lstat,  lstat)
 DYLD_INTERPOSE(ds_SecItemCopyMatching, SecItemCopyMatching)
 
