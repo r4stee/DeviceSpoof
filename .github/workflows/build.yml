@@ -1,0 +1,46 @@
+name: Build iOS Dylib
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compile DeviceSpoof.dylib for iOS (arm64)
+        run: |
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -fobjc-arc \
+            -framework Foundation \
+            -framework UIKit \
+            -framework Security \
+            -framework AdSupport \
+            -install_name @rpath/DeviceSpoof.dylib \
+            -O2 \
+            -Wall \
+            -o DeviceSpoof.dylib \
+            DeviceSpoof.m
+
+          # Sign with ad-hoc signature for iOS compatibility
+          codesign -s - DeviceSpoof.dylib
+
+          # Verify binary architecture and linked libraries
+          file DeviceSpoof.dylib
+          otool -L DeviceSpoof.dylib
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeviceSpoof-dylib
+          path: DeviceSpoof.dylib
+          if-no-files-found: error
